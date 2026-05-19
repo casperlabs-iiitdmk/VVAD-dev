@@ -5,13 +5,20 @@ import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, random_split
 
-# ==========================================
-# 1. THE DATA LOADER
-# ==========================================
+# ==========================================================
+# 1. DATA LOADER (With Uniform Max Scaling Preservation)
+# ==========================================================
 class VisemeDataset(Dataset):
     def __init__(self, data_folder, max_len=75):
-        self.feature_files = sorted(glob.glob(os.path.join(data_folder, "*_features.npy")))
+        raw_feature_files = sorted(glob.glob(os.path.join(data_folder, "*_features.npy")))
         self.max_len = max_len
+        self.feature_files = []
+        
+        for feat_path in raw_feature_files:
+            label_path = feat_path.replace("_features.npy", "_labels.npy")
+            if os.path.exists(label_path):
+                self.feature_files.append(feat_path)
+        print(f"📦 Dataset initialized. Valid paired sequences: {len(self.feature_files)}")
         
     def __len__(self):
         return len(self.feature_files)
@@ -19,159 +26,164 @@ class VisemeDataset(Dataset):
     def __getitem__(self, index):
         feat_path = self.feature_files[index]
         X_raw = np.load(feat_path).astype(np.float32)
-        
-        label_path = feat_path.replace("_features.npy", "_labels.npy")
-        y_raw = np.load(label_path).astype(np.int64)
+        y_raw = np.load(feat_path.replace("_features.npy", "_labels.npy")).astype(np.int64)
+
+        if len(X_raw) > 0:
+            X_raw[:, :400] = X_raw[:, :400] / 255.0  # Crucial Scale Normalization
 
         X_padded = np.zeros((self.max_len, 401), dtype=np.float32)
-        y_padded = np.zeros((self.max_len,), dtype=np.int64)
+        y_padded = np.full((self.max_len,), -100, dtype=np.int64)
         
         actual_len = min(len(X_raw), self.max_len)
         X_padded[:actual_len, :] = X_raw[:actual_len, :]
         y_padded[:actual_len] = y_raw[:actual_len]
-
-        for i in range(X_padded.shape[1]):
-            col = X_padded[:, i]
-            mean = np.mean(col)
-            std = np.std(col) + 1e-6
-            X_padded[:, i] = (col - mean) / std
         
         return torch.from_numpy(X_padded), torch.from_numpy(y_padded)
 
-# ==========================================
-# 2. THE UPGRADED BRAIN (Deeper & Bidirectional)
-# ==========================================
-class VisemeBrainPro(nn.Module):
+
+# ==========================================================
+# 2. HYBRID MODEL ARCHITECTURE
+# ==========================================================
+class ResidualBlock1D(nn.Module):
+    def __init__(self, channels, kernel_size=3):
+        super(ResidualBlock1D, self).__init__()
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        self.bn1 = nn.BatchNorm1d(channels)
+        self.relu = nn.ReLU()
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size=kernel_size, padding=kernel_size//2)
+        self.bn2 = nn.BatchNorm1d(channels)
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += residual  
+        return self.relu(out)
+
+class VisemeHybridPro(nn.Module):
     def __init__(self):
-        super(VisemeBrainPro, self).__init__()
-        
-        # UPGRADE 1: Wider (256), Deeper (4 layers), and Bidirectional
-        self.memory_layer = nn.GRU(
-            input_size=401, 
-            hidden_size=256, 
-            num_layers=4, 
-            batch_first=True, 
-            dropout=0.5,
-            bidirectional=True # Gives context from both past and future frames
-        )
-        
-        # UPGRADE 2: Multi-Layer Perceptron (MLP) Classifier Head
-        # Bidirectional GRU doubles the hidden size (256 * 2 = 512)
-        self.classifier = nn.Sequential(
-            nn.Linear(in_features=512, out_features=256),
-            nn.LayerNorm(256),       # Stabilizes deep network training
+        super(VisemeHybridPro, self).__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Conv1d(in_channels=401, out_channels=256, kernel_size=1),
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-            nn.Dropout(0.5),         # Prevents overfitting
-            
-            nn.Linear(in_features=256, out_features=128),
-            nn.LayerNorm(128),
+            ResidualBlock1D(channels=256, kernel_size=3),
+            nn.Dropout(0.4),  # Increased to prevent early memorization
+            nn.Conv1d(256, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
+            nn.ReLU()
+        )
+        self.memory = nn.GRU(input_size=128, hidden_size=64, num_layers=2, 
+                             batch_first=True, bidirectional=True, dropout=0.4)
+        self.classifier = nn.Sequential(
+            nn.Linear(128, 64), 
             nn.ReLU(),
             nn.Dropout(0.4),
-            
-            nn.Linear(in_features=128, out_features=7) # Final 7 viseme classes
+            nn.Linear(64, 7)
         )
 
     def forward(self, x):
-        # Pass through the recurrent layers
-        brain_thoughts, _ = self.memory_layer(x)
-        
-        # Pass the sequence through the deeper classifier
-        final_guess = self.classifier(brain_thoughts)
-        return final_guess
+        x = x.transpose(1, 2)
+        x = self.feature_extractor(x)
+        x = x.transpose(1, 2)
+        x, _ = self.memory(x)
+        out = self.classifier(x) 
+        return out.transpose(1, 2)
 
-# ==========================================
-# 3. ANTI-OVERFIT TRAINING LOOP
-# ==========================================
-def train_pro_model():
+
+# ==========================================================
+# 3. TRAINING LOOP WITH LIVE ACCURACY METRICS
+# ==========================================================
+def train_hybrid_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    full_dataset = VisemeDataset("./balanced_data") 
+    if len(full_dataset) == 0: return
+
+    # Calculate Smoothed Class Weights (Log-Scale to prevent collapse)
+    all_labels = []
+    for feat_path in full_dataset.feature_files:
+        all_labels.extend(np.load(feat_path.replace("_features.npy", "_labels.npy")).flatten())
+    classes, counts = np.unique(all_labels, return_counts=True)
     
-    data_path = r"C:\Users\sudheendraa A G\OneDrive\Desktop\my learnings\python.py\VVAD\processed_data"
-    full_dataset = VisemeDataset(data_path) 
-    
+    computed_weights = np.ones(7, dtype=np.float32)
+    for c, count in zip(classes, counts):
+        if c < 7:
+            computed_weights[c] = 1.0 / (np.log1p(count) + 1e-5) # Smooth Log dampening
+    computed_weights = computed_weights / np.sum(computed_weights) * 7.0
+    weights_tensor = torch.tensor(computed_weights, dtype=torch.float32).to(device)
+
+    # Cross-Entropy with Label Smoothing breaks local minima cheating loops
+    criterion = nn.CrossEntropyLoss(weight=weights_tensor, ignore_index=-100, label_smoothing=0.1)
+
     train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
-    
+    val_dataset, train_dataset = random_split(full_dataset, [len(full_dataset)-train_size, train_size])
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    
-    print(f"🚀 Starting 150-Cycle BOOTCAMP Training on {device}...")
-    print(f"📈 Dataset Split: {train_size} training videos | {val_size} validation videos")
 
-    # Use the new, upgraded model
-    student = VisemeBrainPro().to(device)
-    teacher_grader = nn.CrossEntropyLoss()
-    
-    # Slightly lowered weight decay since we added more dropout/layernorm
-    optimizer = torch.optim.Adam(student.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.5) 
-    
-    best_val_error = float('inf')
-    patience = 15 
-    epochs_no_improve = 0 
-    
-    for epoch in range(150): 
-        # ==========================
-        # PHASE A: TRAINING
-        # ==========================
+    student = VisemeHybridPro().to(device)
+    optimizer = torch.optim.AdamW(student.parameters(), lr=0.0005, weight_decay=1e-3) # Lowered LR
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=4) 
+
+    best_val_acc = 0.0
+    patience, no_improvement = 15, 0
+
+    for epoch in range(100):
         student.train()
-        train_error = 0
+        train_loss, train_correct, train_total = 0, 0, 0
         
-        for video_math, correct_answers in train_loader:
-            video_math, correct_answers = video_math.to(device), correct_answers.to(device)
-            
-            # 🛡️ DATA AUGMENTATION: Inject noise so the model can't memorize pixels
-            noise = torch.randn_like(video_math) * 0.05 # 5% visual static
-            video_math_noisy = video_math + noise
+        for video_math, targets in train_loader:
+            video_math, targets = video_math.to(device), targets.to(device)
+            video_math = video_math + torch.randn_like(video_math) * 0.01 # Subtle Noise
             
             optimizer.zero_grad()
-            guesses = student(video_math_noisy)
-            loss = teacher_grader(guesses.view(-1, 7), correct_answers.view(-1))
-            
+            guesses = student(video_math)
+            loss = criterion(guesses, targets)
             loss.backward()
             nn.utils.clip_grad_norm_(student.parameters(), max_norm=1.0)
             optimizer.step()
             
-            train_error += loss.item()
+            train_loss += loss.item()
             
-        # ==========================
-        # PHASE B: VALIDATION
-        # ==========================
-        student.eval() 
-        val_error = 0
-        
-        with torch.no_grad(): 
-            for video_math, correct_answers in val_loader:
-                video_math, correct_answers = video_math.to(device), correct_answers.to(device)
-                
-                # NO NOISE IN VALIDATION - The exam must be clean!
-                guesses = student(video_math)
-                loss = teacher_grader(guesses.view(-1, 7), correct_answers.view(-1))
-                val_error += loss.item()
-        
-        avg_train = train_error / len(train_loader)
-        avg_val = val_error / len(val_loader)
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        print(f"Cycle {epoch + 1:03d}/150 | Train Error: {avg_train:.4f} | Val Error: {avg_val:.4f} | LR: {current_lr:.6f}")
-        
-        scheduler.step()
+            # Calculate live operational accuracy
+            preds = torch.argmax(guesses, dim=1)
+            mask = targets != -100
+            train_correct += (preds[mask] == targets[mask]).sum().item()
+            train_total += mask.sum().item()
 
-        if avg_val < best_val_error:
-            best_val_error = avg_val
-            epochs_no_improve = 0 
-            torch.save(student.state_dict(), "best_pro_model.pth")
-            print("   🌟 New best validation score! Model saved.")
+        # Validation Pass
+        student.eval()
+        val_loss, val_correct, val_total = 0, 0, 0
+        with torch.no_grad():
+            for video_math, targets in val_loader:
+                video_math, targets = video_math.to(device), targets.to(device)
+                guesses = student(video_math)
+                loss = criterion(guesses, targets)
+                val_loss += loss.item()
+                
+                preds = torch.argmax(guesses, dim=1)
+                mask = targets != -100
+                val_correct += (preds[mask] == targets[mask]).sum().item()
+                val_total += mask.sum().item()
+
+        avg_train_loss = train_loss / len(train_loader)
+        train_acc = (train_correct / train_total) * 100
+        val_acc = (val_correct / val_total) * 100
+        
+        print(f"Epoch {epoch+1:02d} | Train Loss: {avg_train_loss:.4f} | Train Acc: {train_acc:.1f}% | Val Acc: {val_acc:.1f}% | LR: {optimizer.param_groups[0]['lr']:.6f}")
+        
+        scheduler.step(val_acc) # Scale learning rate based on real accuracy, not loss!
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            no_improvement = 0
+            torch.save(student.state_dict(), "best_model.pth")
+            print(f"   🌟 Real Validation Accuracy Improved to {val_acc:.2f}%! Weights saved.")
         else:
-            epochs_no_improve += 1
-            print(f"   ⚠️ No improvement for {epochs_no_improve}/{patience} cycles.")
+            no_improvement += 1
             
-        if epochs_no_improve >= patience:
-            print(f"\n🛑 EARLY STOPPING TRIGGERED! The student hasn't improved on unseen data in {patience} cycles.")
+        if no_improvement >= patience:
+            print("\n🛑 Stop trigger reached. Class collapse successfully averted.")
             break
 
-    print("\n🎓 Training Complete!")
-    print(f"💾 The absolute best version of the brain is saved as 'best_pro_model.pth' with a Validation Error of {best_val_error:.4f}")
-
 if __name__ == "__main__":
-    train_pro_model()
+    train_hybrid_model()
